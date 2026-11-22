@@ -4,10 +4,11 @@
 // for the same input: a plain object mapping each output path to its text, byte
 // for byte. The dialect is makefun-site's own (front matter, templates,
 // Markdown subset, slug rule and build report), reimplemented here from its
-// published rules with the hot paths written for speed: bulk escaping instead
-// of per-character calls, an index-based inline scanner instead of recursive
-// slicing, cached slugs, and line classifiers that read char codes instead of
-// stacking regular expressions.
+// published rules with the hot paths written for speed: bulk escaping with the
+// scan left to the regex engine, an index-based inline scanner instead of
+// recursive slicing, cached slugs, include renders memoised on the values
+// they read, and line classifiers that read char codes instead of stacking
+// regular expressions.
 //
 // The module is dependency-free and holds no state between calls: every run
 // answers its case alone.
@@ -50,31 +51,40 @@ function wordsOf(text) {
 // ---------------------------------------------------------------------------
 
 const ESCAPE_FIRST = /[&<>"']/;
+const ESCAPE_RE = /[&<>"']/g;
+const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const escapeCache = new Map();
 
 /**
  * `text` with & < > " and ' escaped, and nothing else touched. A native scan
  * finds the first special character; a text holding none of the five is
- * itself, and the rest is copied in bulk runs between replacements.
+ * itself. Past the first special, the remaining ones are found by the regex
+ * engine and the text between them is copied in bulk runs, never walked
+ * character by character. Short results are memoised: the same titles, tag
+ * names and dates are escaped on page after page of one build, and escaping
+ * is a pure function of the text.
  */
 export function escapeHtml(text) {
   const first = text.search(ESCAPE_FIRST);
   if (first === -1) return text;
+  if (text.length <= 200) {
+    const hit = escapeCache.get(text);
+    if (hit !== undefined) return hit;
+  }
+  ESCAPE_RE.lastIndex = first;
   let out = text.slice(0, first);
   let last = first;
-  for (let i = first; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    let rep = null;
-    if (c === 38) rep = '&amp;';
-    else if (c === 60) rep = '&lt;';
-    else if (c === 62) rep = '&gt;';
-    else if (c === 34) rep = '&quot;';
-    else if (c === 39) rep = '&#39;';
-    if (rep !== null) {
-      out += text.slice(last, i) + rep;
-      last = i + 1;
-    }
+  let m;
+  while ((m = ESCAPE_RE.exec(text)) !== null) {
+    out += text.slice(last, m.index) + ESCAPES[m[0]];
+    last = m.index + 1;
   }
-  return out + text.slice(last);
+  const done = out + text.slice(last);
+  if (text.length <= 200) {
+    if (escapeCache.size > 8192) escapeCache.clear();
+    escapeCache.set(text, done);
+  }
+  return done;
 }
 
 const SLUG_MAX = 64;
@@ -368,30 +378,41 @@ const isEscapable = (ch) => {
   return c < 128 && ESCAPABLE[c];
 };
 
+/**
+ * Whether the character at `j` is escaped: preceded by an odd run of
+ * backslashes. A run pairs off from its left (\\ is an escaped backslash),
+ * so an odd run leaves one backslash free to escape what follows. This is
+ * the per-character scanner's answer, computed from the run alone; the
+ * searches below always start right after a character that is not a
+ * backslash (an opener), so no run crosses their start.
+ */
+function isEscapedAt(s, j) {
+  let run = 0;
+  for (let k = j - 1; k >= 0 && s[k] === '\\'; k--) run++;
+  return run % 2 === 1;
+}
+
 /** The first index in [from, hi) where `s` holds `what` outside a backslash escape, or -1. */
 function findUnescaped(s, what, from, hi) {
   const wlen = what.length;
-  for (let j = from; j <= hi - wlen; j++) {
-    if (s[j] === '\\' && j + 1 < hi && isEscapable(s[j + 1])) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
+  let j = s.indexOf(what, from);
+  while (j !== -1 && j + wlen <= hi) {
+    if (!isEscapedAt(s, j)) return j;
+    j = s.indexOf(what, j + 1);
   }
   return -1;
 }
 
 /** The first single * in [from, hi) (one whose run is not **), outside an escape, or -1. */
 function findSingleStar(s, from, hi) {
-  for (let j = from; j < hi; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < hi && isEscapable(s[j + 1])) {
-      j++;
+  let j = s.indexOf('*', from);
+  while (j !== -1 && j < hi) {
+    if (isEscapedAt(s, j)) {
+      j = s.indexOf('*', j + 1);
       continue;
     }
-    if (c !== '*') continue;
     if (j + 1 < hi && s[j + 1] === '*') {
-      j++;
+      j = s.indexOf('*', j + 2);
       continue;
     }
     return j;
@@ -495,8 +516,14 @@ function inlineRange(s, lo, hi, env, out) {
   }
 }
 
+const CONSTRUCT_TEST = /[\\`*[]/;
+
 /** A whole string rendered inline. */
 function renderInline(s, env) {
+  // Most short strings (headings, list items, plain paragraphs) hold no
+  // construct character at all: they are just their escaping, with no
+  // parts array built and joined.
+  if (!CONSTRUCT_TEST.test(s)) return escapeHtml(s);
   const out = [];
   inlineRange(s, 0, s.length, env, out);
   return out.join('');
@@ -590,8 +617,8 @@ function renderMarkdown(lines, env, slugify) {
 }
 
 // ---------------------------------------------------------------------------
-// Templates: parsed once per case into node trees, then rendered by walking
-// the tree in a chain of scopes.
+// Templates: parsed once per case into node trees, then compiled to plain
+// functions that render in a chain of scopes.
 // ---------------------------------------------------------------------------
 
 const INCLUDE_DEPTH = 8;
@@ -737,11 +764,11 @@ function tplTruthy(v) {
 
 /**
  * The root names a template reads, following includes with the names bound at
- * each include point: a template whose roots are only the build-wide values
- * (site, tags, recent) renders the same text everywhere it is included at the
- * top level of a page, unless a loop binds one of those names around the
- * include. Returns null when the walk cannot finish (an include cycle, or a
- * template set too tangled to analyse within the step budget).
+ * each include point. A template's rendering is a pure function of the values
+ * those roots resolve to, so the set is the fingerprint an include render is
+ * memoised on: the same template reached with the same values renders the
+ * same text. Returns null when the walk cannot finish (an include cycle, or
+ * a template set too tangled to analyse within the step budget).
  */
 function tplFreeRoots(name, templates) {
   const acc = new Set();
@@ -782,68 +809,216 @@ function tplFreeRoots(name, templates) {
 }
 
 /**
- * `nodes` rendered in `scope` ({ vars, parent }), appending string parts to
- * `out`. `ctx` carries the parsed templates, the per-build cache of constant
- * include renders, and the names currently bound by loops (a constant include
- * is only reused where no loop binds a name it reads).
+ * The longest include chain starting at template `name`: 0 when it includes
+ * nothing, Infinity when the chain cycles. A memoised render is only reused
+ * at depths where the whole chain stays clear of the include depth cap, so
+ * the cap can never make two call sites disagree about the same template.
  */
-function renderNodes(nodes, scope, ctx, depth, out) {
-  for (const n of nodes) {
-    switch (n.kind) {
-      case 'text':
-        out.push(n.text);
-        break;
-      case 'var':
-        out.push(escapeHtml(tplTextOf(tplLookup(scope, n.path))));
-        break;
-      case 'raw':
-        out.push(tplTextOf(tplLookup(scope, n.path)));
-        break;
-      case 'if': {
-        const v = tplTruthy(tplLookup(scope, n.path));
-        const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) renderNodes(branch, scope, ctx, depth, out);
-        break;
-      }
-      case 'for': {
-        const xs = tplLookup(scope, n.path);
-        if (!Array.isArray(xs)) break;
-        ctx.bound.set(n.name, (ctx.bound.get(n.name) ?? 0) + 1);
-        ctx.bound.set('loop', (ctx.bound.get('loop') ?? 0) + 1);
-        for (let k = 0; k < xs.length; k++) {
-          const vars = {
-            [n.name]: xs[k],
-            loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length },
-          };
-          renderNodes(n.body, { vars, parent: scope }, ctx, depth, out);
-        }
-        for (const key of [n.name, 'loop']) {
-          const left = ctx.bound.get(key) - 1;
-          if (left <= 0) ctx.bound.delete(key);
-          else ctx.bound.set(key, left);
-        }
-        break;
-      }
-      case 'include': {
-        const t = ctx.templates.get(n.name);
-        if (t === undefined || depth >= INCLUDE_DEPTH) break;
-        const free = depth === 0 ? ctx.constFree.get(n.name) : undefined;
-        if (free !== undefined && ![...free].some((r) => ctx.bound.has(r))) {
-          let cached = ctx.cache.get(n.name);
-          if (cached === undefined) {
-            const parts = [];
-            renderNodes(t, scope, ctx, depth + 1, parts);
-            cached = parts.join('');
-            ctx.cache.set(n.name, cached);
-          }
-          out.push(cached);
-        } else {
-          renderNodes(t, scope, ctx, depth + 1, out);
-        }
-        break;
+function tplIncludeHeight(name, templates, cache, seen) {
+  if (cache.has(name)) return cache.get(name);
+  if (seen.has(name)) return Infinity;
+  seen.add(name);
+  let h = 0;
+  const nodes = templates.get(name);
+  if (nodes !== undefined) {
+    const stack = [...nodes];
+    while (stack.length > 0 && h !== Infinity) {
+      const n = stack.pop();
+      if (n.kind === 'include') {
+        const th = tplIncludeHeight(n.name, templates, cache, seen);
+        if (th === Infinity) h = Infinity;
+        else if (th + 1 > h) h = th + 1;
+      } else if (n.kind === 'for') stack.push(...n.body);
+      else if (n.kind === 'if') {
+        stack.push(...n.then);
+        if (n.else !== null) stack.push(...n.else);
       }
     }
   }
+  seen.delete(name);
+  if (h !== Infinity) cache.set(name, h);
+  return h;
+}
+
+/** The value at `path[i..]` under `v`: own properties only, undefined when a step is not an object holding it. */
+function tplWalk(v, path, i) {
+  for (; i < path.length; i++) {
+    if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[i])) return undefined;
+    v = v[path[i]];
+  }
+  return v;
+}
+
+/**
+ * An include of `name` rendered in `scope`, appending to `out`. The memo
+ * rules live here, so a compiled template calls it exactly where the node
+ * walk would have: a memoised render is keyed on the value its template
+ * reads. For a template reading only the build-wide values, the name alone
+ * (guarded by the loop bindings of those names, which ctx.bound tracks);
+ * for a template reading one root, that root's value, by identity for
+ * objects (their fields are fixed before rendering starts, so identity is
+ * value) and by the value itself for primitives. A single-root render is
+ * reused only where the template's whole include chain stays clear of the
+ * depth cap: there the text cannot depend on the depth it is reached at.
+ */
+function renderInclude(name, scope, ctx, depth, out) {
+  const t = ctx.compiled.get(name);
+  if (t === undefined || depth >= INCLUDE_DEPTH) return;
+  const mode = ctx.modes.get(name);
+  if (mode === 'const' && depth === 0 && ctx.bound.size === 0) {
+    let cached = ctx.memoByName.get(name);
+    if (cached === undefined) {
+      const parts = [];
+      t(scope, ctx, depth + 1, parts, TPL_HELPERS);
+      cached = parts.join('');
+      ctx.memoByName.set(name, cached);
+    }
+    out.push(cached);
+    return;
+  }
+  if (mode === 'single' && depth + (ctx.heights.get(name) ?? Infinity) < INCLUDE_DEPTH) {
+    const v = tplLookup(scope, [ctx.singleRoot.get(name)]);
+    let store = ctx.memoByRoot.get(name);
+    if (store === undefined) {
+      store = { weak: new WeakMap(), prim: new Map() };
+      ctx.memoByRoot.set(name, store);
+    }
+    const isObj = v !== null && (typeof v === 'object' || typeof v === 'function');
+    let cached = isObj ? store.weak.get(v) : store.prim.get(v);
+    if (cached === undefined) {
+      const parts = [];
+      t(scope, ctx, depth + 1, parts, TPL_HELPERS);
+      cached = parts.join('');
+      if (isObj) store.weak.set(v, cached);
+      else store.prim.set(v, cached);
+    }
+    out.push(cached);
+    return;
+  }
+  t(scope, ctx, depth + 1, out, TPL_HELPERS);
+}
+
+const TPL_HELPERS = {
+  lookup: tplLookup,
+  walk: tplWalk,
+  text: tplTextOf,
+  truthy: tplTruthy,
+  esc: escapeHtml,
+  include: renderInclude,
+};
+
+/**
+ * A template compiled to a plain function, once per build: walking the node
+ * tree a thousand times over is the slow way to render a thousand pages, so
+ * the walk happens here, at compile time, and what runs per page is the
+ * straight-line code the walk would have executed. Text nodes become
+ * literal pushes; a path whose root an enclosing loop binds becomes a read
+ * of that loop's local variable, not a scope-chain lookup; an include
+ * inside a loop receives a scope holding exactly the locals bound there.
+ * Every value rule (lookup, conversion, truth, escaping, the depth cap,
+ * the memo) is the shared helper's, unchanged. Generated names carry a "$"
+ * because template names cannot: no loop variable a template names can
+ * collide with the machinery.
+ */
+function compileTemplate(nodes) {
+  const lines = [];
+  const scopes = [];
+  let temp = 0;
+  let loopN = 0;
+  const resolveRoot = (root) => {
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      const local = scopes[i].get(root);
+      if (local !== undefined) return local;
+    }
+    return null;
+  };
+  const pathExpr = (path) => {
+    const local = resolveRoot(path[0]);
+    if (local !== null) {
+      return path.length === 1 ? local : `$H.walk(${local}, ${JSON.stringify(path)}, 1)`;
+    }
+    return `$H.lookup($scope, ${JSON.stringify(path)})`;
+  };
+  const gen = (ns) => {
+    for (const n of ns) {
+      switch (n.kind) {
+        case 'text':
+          lines.push(`$out.push(${JSON.stringify(n.text)});`);
+          break;
+        case 'var':
+          lines.push(`$out.push($H.esc($H.text(${pathExpr(n.path)})));`);
+          break;
+        case 'raw':
+          lines.push(`$out.push($H.text(${pathExpr(n.path)}));`);
+          break;
+        case 'if': {
+          const t = `$t${temp++}`;
+          lines.push(`const ${t} = $H.truthy(${pathExpr(n.path)});`);
+          lines.push(`if (${t} !== ${n.not}) {`);
+          gen(n.then);
+          if (n.else !== null) {
+            lines.push('} else {');
+            gen(n.else);
+          }
+          lines.push('}');
+          break;
+        }
+        case 'for': {
+          const id = loopN++;
+          const item = `${n.name}$${id}`;
+          const loop = `loop$${id}`;
+          const arr = `$a${id}`;
+          const idx = `$i${id}`;
+          const key = JSON.stringify(n.name);
+          const tracked = n.name === 'site' || n.name === 'tags' || n.name === 'recent';
+          lines.push(`const ${arr} = ${pathExpr(n.path)};`);
+          lines.push(`if (Array.isArray(${arr})) {`);
+          if (tracked) {
+            lines.push(`$ctx.bound.set(${key}, ($ctx.bound.get(${key}) ?? 0) + 1);`);
+          }
+          lines.push(`for (let ${idx} = 0; ${idx} < ${arr}.length; ${idx}++) {`);
+          lines.push(`const ${item} = ${arr}[${idx}];`);
+          lines.push(
+            `const ${loop} = { index: ${idx} + 1, first: ${idx} === 0, last: ${idx} === ${arr}.length - 1, length: ${arr}.length };`,
+          );
+          scopes.push(new Map([[n.name, item], ['loop', loop]]));
+          gen(n.body);
+          scopes.pop();
+          lines.push('}');
+          if (tracked) {
+            lines.push(
+              `{ const left$${id} = $ctx.bound.get(${key}) - 1; ` +
+                `if (left$${id} <= 0) $ctx.bound.delete(${key}); else $ctx.bound.set(${key}, left$${id}); }`,
+            );
+          }
+          lines.push('}');
+          break;
+        }
+        case 'include': {
+          if (scopes.length === 0) {
+            lines.push(`$H.include(${JSON.stringify(n.name)}, $scope, $ctx, $depth, $out);`);
+          } else {
+            const seen = new Set();
+            const vars = [];
+            for (let i = scopes.length - 1; i >= 0; i--) {
+              for (const [k, v] of scopes[i]) {
+                if (!seen.has(k)) {
+                  seen.add(k);
+                  vars.push(`${JSON.stringify(k)}: ${v}`);
+                }
+              }
+            }
+            lines.push(
+              `$H.include(${JSON.stringify(n.name)}, { vars: { ${vars.join(', ')} }, parent: $scope }, $ctx, $depth, $out);`,
+            );
+          }
+          break;
+        }
+      }
+    }
+  };
+  gen(nodes);
+  return new Function('$scope', '$ctx', '$depth', '$out', '$H', lines.join('\n'));
 }
 
 // ---------------------------------------------------------------------------
@@ -897,16 +1072,34 @@ function buildSite(input) {
     }
   }
 
-  // Templates that read only the build-wide values (site, tags, recent) are
-  // constant across a build: their top-level include renders are cached.
-  const constFree = new Map();
+  // Every template's memo mode, from the roots it reads: "const" when they
+  // are only the build-wide values (site, tags, recent), so one render
+  // serves every page; "single" when there is just one, so a card included
+  // by the index and again by each of the post's tag pages renders once per
+  // post. Anything wider is rendered where it stands.
+  const modes = new Map();
+  const singleRoot = new Map();
   for (const name of templates.keys()) {
     const free = tplFreeRoots(name, templates);
-    if (free !== null && [...free].every((r) => r === 'site' || r === 'tags' || r === 'recent')) {
-      constFree.set(name, free);
-    }
+    if (free === null) modes.set(name, 'none');
+    else if ([...free].every((r) => r === 'site' || r === 'tags' || r === 'recent')) modes.set(name, 'const');
+    else if (free.size === 1) {
+      modes.set(name, 'single');
+      singleRoot.set(name, [...free][0]);
+    } else modes.set(name, 'none');
   }
-  const tplCtx = { templates, constFree, cache: new Map(), bound: new Map() };
+  const heightCache = new Map();
+  const heights = new Map();
+  for (const name of templates.keys()) {
+    const h = tplIncludeHeight(name, templates, heightCache, new Set());
+    if (h !== Infinity) heights.set(name, h);
+  }
+  const compiled = new Map();
+  for (const [name, nodes] of templates) compiled.set(name, compileTemplate(nodes));
+  const tplCtx = {
+    templates, modes, singleRoot, heights, compiled,
+    memoByName: new Map(), memoByRoot: new Map(), bound: new Map(),
+  };
 
   const base = input.site.base_url.replace(/\/+$/, '');
   const sources = [];
@@ -1068,8 +1261,7 @@ function buildSite(input) {
   // joins two lines is whitespace, so no word runs across a join.
   const cardOf = (s) => {
     if (s.card !== undefined) return s.card;
-    let words = 0;
-    for (const line of s.bodyLines) words += wordsOf(line);
+    const words = wordsOf(s.bodyLines.join('\n'));
     s.card = {
       title: s.data.title,
       url: s.url,
@@ -1086,7 +1278,7 @@ function buildSite(input) {
     ...cardOf(s),
     slug: s.slug,
     content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+    toc: s.toc,
     newer: linkOf(s.newer ?? null),
     older: linkOf(s.older ?? null),
     is_post: s.post,
@@ -1099,10 +1291,10 @@ function buildSite(input) {
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
   const render = (name, vars) => {
-    const nodes = templates.get(name);
-    if (nodes === undefined) return null;
+    const fn = compiled.get(name);
+    if (fn === undefined) return null;
     const out = [];
-    renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, tplCtx, 0, out);
+    fn({ vars: { site, tags: allTags, recent, ...vars }, parent: null }, tplCtx, 0, out, TPL_HELPERS);
     return out.join('');
   };
   const output = {};
