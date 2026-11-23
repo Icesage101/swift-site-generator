@@ -1,14 +1,21 @@
-// swift-site-generator: a fast drop-in replacement for makefun-site 1.0.0.
+// swift-site-generator, byte-level edition: a fast drop-in replacement for
+// makefun-site 1.0.0.
 //
-// run(input) returns exactly the output tree makefun-site 1.0.0's build returns
-// for the same input: a plain object mapping each output path to its text, byte
-// for byte. The dialect is makefun-site's own (front matter, templates,
-// Markdown subset, slug rule and build report), reimplemented here from its
-// published rules with the hot paths written for speed: bulk escaping with the
-// scan left to the regex engine, an index-based inline scanner instead of
-// recursive slicing, cached slugs, include renders memoised on the values
-// they read, and line classifiers that read char codes instead of stacking
-// regular expressions.
+// run(input) returns exactly the output tree makefun-site 1.0.0's build
+// returns for the same input: a plain object mapping each output path to its
+// text, byte for byte. The dialect is makefun-site's own (front matter,
+// templates, Markdown subset, slug rule and build report).
+//
+// This edition is written around one idea: never copy text you can point
+// at. A source file is normalised once and then worked on in place — the
+// front matter is read from line ranges at its head, the body is scanned as
+// line ranges of the same string, each line classified exactly once, and
+// the inline renderer walks a paragraph's own range of the body, copying
+// plain runs as single slices. One native scan finds every character that
+// matters inline (the five HTML escapes and the four construct openers), so
+// a run between two of them needs no escaping at all and is copied whole.
+// Word counting rides on the same pass: every body line is counted as it is
+// consumed, instead of the body being joined and scanned a second time.
 //
 // The module is dependency-free and holds no state between calls: every run
 // answers its case alone.
@@ -32,12 +39,19 @@ function isSpaceCode(c) {
   );
 }
 
-/** The number of words in a text: its runs of characters other than whitespace. */
-function wordsOf(text) {
+/** isSpaceCode as a table: the word counter reads it once per character. */
+const SPACE_TABLE = (() => {
+  const t = new Uint8Array(65536);
+  for (let c = 0; c < 65536; c++) t[c] = isSpaceCode(c) ? 1 : 0;
+  return t;
+})();
+
+/** The number of words in s[lo, hi): its runs of characters other than whitespace. */
+function wordsInRange(s, lo, hi) {
   let count = 0;
   let inWord = false;
-  for (let i = 0; i < text.length; i++) {
-    if (isSpaceCode(text.charCodeAt(i))) inWord = false;
+  for (let i = lo; i < hi; i++) {
+    if (SPACE_TABLE[s.charCodeAt(i)] === 1) inWord = false;
     else if (!inWord) {
       inWord = true;
       count++;
@@ -45,6 +59,7 @@ function wordsOf(text) {
   }
   return count;
 }
+
 
 // ---------------------------------------------------------------------------
 // Text rules: HTML escaping, slugs, long dates
@@ -87,14 +102,38 @@ export function escapeHtml(text) {
   return done;
 }
 
+/** A second escape regex, for range escaping: escapeHtml's is never shared mid-scan. */
+const ESCAPE_RANGE_RE = /[&<>"']/g;
+
+/**
+ * s[lo, hi) HTML-escaped, appended to `out` in pieces: the raw runs between
+ * special characters (copied as single slices) and the replacements. The
+ * concatenation is exactly escapeHtml of the range's text.
+ */
+function escapeRangeInto(s, lo, hi, out) {
+  ESCAPE_RANGE_RE.lastIndex = lo;
+  let last = lo;
+  let m;
+  while ((m = ESCAPE_RANGE_RE.exec(s)) !== null) {
+    if (m.index >= hi) break;
+    if (m.index > last) out.push(s.slice(last, m.index));
+    out.push(ESCAPES[m[0]]);
+    last = m.index + 1;
+  }
+  if (hi > last) out.push(s.slice(last, hi));
+}
+
 const SLUG_MAX = 64;
 
 /**
  * The slug of `text`, uncached: NFKD, combining marks dropped, A-Z lowered,
  * every run of characters other than a-z and 0-9 one "-", none at either end,
- * cut to 64 characters with a "-" left at the cut dropped, and "untitled" when
- * nothing is left. Pure-ASCII text skips normalisation: no ASCII character
- * decomposes under NFKD and none is a combining mark.
+ * cut to 64 characters with a "-" left at the cut dropped, and "untitled"
+ * when nothing is left. Pure-ASCII text skips normalisation: no ASCII
+ * character decomposes under NFKD and none is a combining mark. The scan
+ * reads code units: after normalisation a character outside a-z0-9 is a gap
+ * whether it is one code point or a surrogate pair, and the gap is a
+ * boolean, so the pair collapses exactly as the single code point would.
  */
 function slugifyRaw(text) {
   let plain = text;
@@ -108,17 +147,18 @@ function slugifyRaw(text) {
   if (!ascii) plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
   let out = '';
   let gap = false;
-  for (const ch of plain) {
-    let keep = null;
-    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-    if (keep === null) {
+  for (let i = 0; i < plain.length; i++) {
+    const c = plain.charCodeAt(i);
+    let keep = -1;
+    if (c >= 65 && c <= 90) keep = c + 32;
+    else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
+    if (keep === -1) {
       gap = out.length > 0;
       continue;
     }
     if (gap) out += '-';
     gap = false;
-    out += keep;
+    out += String.fromCharCode(keep);
   }
   out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
   return out === '' ? 'untitled' : out;
@@ -139,12 +179,13 @@ const MONTHS = [
 
 /** A YYYY-MM-DD date in words, from the string alone: "2026-11-09" is "9 November 2026". */
 function longDate(date) {
-  const [y, m, d] = date.split('-');
-  return `${Number(d)} ${MONTHS[Number(m) - 1]} ${y}`;
+  return `${Number(date.slice(8, 10))} ${MONTHS[Number(date.slice(5, 7)) - 1]} ${date.slice(0, 4)}`;
 }
 
 // ---------------------------------------------------------------------------
-// Front matter
+// Front matter. The text is never split: the head is walked as line ranges,
+// first to find the closing "---" (a refusal there outranks any bad line),
+// then to read the lines between.
 // ---------------------------------------------------------------------------
 
 const FM_KEYS = ['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary'];
@@ -229,26 +270,43 @@ function fmValue(key, raw) {
 }
 
 /**
- * A source's front matter, read from its pre-split `lines`: { data, bodyLines }
- * or { error } with the first reason the source is refused. The body is the
- * lines after the closing "---", exactly the lines of the joined body text.
+ * A source's front matter, read from the head of its (newline-normalised)
+ * text: { data, bodyStart } or { error } with the first reason the source
+ * is refused. The body is the text from bodyStart on: exactly the lines
+ * after the closing "---", joined by the newlines that separated them.
  */
-function parseFrontMatter(lines) {
-  if (lines[0] !== '---') return { error: 'no front matter' };
-  let close = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === '---') {
-      close = i;
+function parseFrontMatter(text) {
+  const len = text.length;
+  const firstNl = text.indexOf('\n');
+  const firstHi = firstNl === -1 ? len : firstNl;
+  if (firstHi !== 3 || text.charCodeAt(0) !== 45 || text.charCodeAt(1) !== 45 || text.charCodeAt(2) !== 45) {
+    return { error: 'no front matter' };
+  }
+  // First pass: find the closing line, as line ranges [lo, hi) with the
+  // 1-based line number. A text that ends in a newline has one last empty
+  // line after it; the walk visits it like any other.
+  const fmLines = [];
+  let closeNext = -1;
+  let pos = firstNl === -1 ? len + 1 : firstNl + 1;
+  let lineNo = 1;
+  while (pos <= len) {
+    lineNo++;
+    const nl = text.indexOf('\n', pos);
+    const hi = nl === -1 ? len : nl;
+    if (hi - pos === 3 && text.charCodeAt(pos) === 45 && text.charCodeAt(pos + 1) === 45 && text.charCodeAt(pos + 2) === 45) {
+      closeNext = nl === -1 ? len : nl + 1;
       break;
     }
+    fmLines.push([pos, hi, lineNo]);
+    pos = nl === -1 ? len + 1 : nl + 1;
   }
-  if (close === -1) return { error: 'the front matter is not closed' };
+  if (closeNext === -1) return { error: 'the front matter is not closed' };
   const data = {};
-  for (let i = 1; i < close; i++) {
-    const line = lines[i];
+  for (const [lo, hi, no] of fmLines) {
+    const line = text.slice(lo, hi);
     if (/^[ \t]*$/.test(line) || line.startsWith('#')) continue;
     const m = FM_LINE.exec(line);
-    if (!m) return { error: `line ${i + 1} is not "key: value"` };
+    if (!m) return { error: `line ${no} is not "key: value"` };
     const key = m[1];
     const raw = (m[2] ?? '').replace(/[ \t]+$/, '');
     if (!FM_KEYS.includes(key)) return { error: `unknown key "${key}"` };
@@ -259,30 +317,39 @@ function parseFrontMatter(lines) {
     data[key] = v.value;
   }
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
-  return { data, bodyLines: lines.slice(close + 1) };
+  return { data, bodyStart: closeNext };
 }
 
 // ---------------------------------------------------------------------------
-// Markdown: block lexing over pre-split lines, and an inline scanner that
-// works on index ranges of the original string instead of slicing substrings.
+// Markdown: a single pass over the body's line ranges. Each line is
+// classified once (a classification a paragraph reaches is kept for the
+// dispatch that follows it), blocks are read from ranges of the body text,
+// and every line's words are counted as the line is consumed.
 // ---------------------------------------------------------------------------
 
-/** A line of nothing but spaces and tabs (or nothing at all). */
-function isBlankLine(line) {
-  for (let i = 0; i < line.length; i++) {
-    const c = line.charCodeAt(i);
+const K_BLANK = 0;
+const K_FENCE = 1;
+const K_HEADING = 2;
+const K_BREAK = 3;
+const K_QUOTE = 4;
+const K_BULLET = 5;
+const K_ORDERED = 6;
+const K_TEXT = 7;
+
+/** Whether s[lo, hi) is nothing but spaces and tabs (or nothing at all). */
+function isBlankRange(s, lo, hi) {
+  for (let i = lo; i < hi; i++) {
+    const c = s.charCodeAt(i);
     if (c !== 32 && c !== 9) return false;
   }
   return true;
 }
 
-/** A line's trailing spaces and tabs dropped, then its leading ones too. */
-function trimLine(line) {
-  let lo = 0;
-  let hi = line.length;
-  while (lo < hi && (line.charCodeAt(lo) === 32 || line.charCodeAt(lo) === 9)) lo++;
-  while (hi > lo && (line.charCodeAt(hi - 1) === 32 || line.charCodeAt(hi - 1) === 9)) hi--;
-  return lo === 0 && hi === line.length ? line : line.slice(lo, hi);
+/** s[lo, hi) with leading and trailing spaces and tabs dropped: the trimmed range. */
+function trimRange(s, lo, hi) {
+  while (lo < hi && (s.charCodeAt(lo) === 32 || s.charCodeAt(lo) === 9)) lo++;
+  while (hi > lo && (s.charCodeAt(hi - 1) === 32 || s.charCodeAt(hi - 1) === 9)) hi--;
+  return [lo, hi];
 }
 
 /** Whether `code` may follow a fence's opening backticks in a language name. */
@@ -290,82 +357,81 @@ function isLangCode(c) {
   return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45;
 }
 
-/** A fence opening line's language, or null: three backticks, a language, then spaces/tabs only. */
-function fenceOpenOf(line) {
-  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
-  let i = 3;
-  while (i < line.length && isLangCode(line.charCodeAt(i))) i++;
-  const langEnd = i;
-  while (i < line.length && (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9)) i++;
-  return i === line.length ? line.slice(3, langEnd) : null;
+/** A fence opening line's language range, or null: three backticks, a language, then spaces/tabs only. */
+function fenceOpenRange(s, lo, hi) {
+  if (hi - lo < 3 || s.charCodeAt(lo) !== 96 || s.charCodeAt(lo + 1) !== 96 || s.charCodeAt(lo + 2) !== 96) return null;
+  let i = lo + 3;
+  while (i < hi && isLangCode(s.charCodeAt(i))) i++;
+  const langHi = i;
+  while (i < hi && (s.charCodeAt(i) === 32 || s.charCodeAt(i) === 9)) i++;
+  return i === hi ? [lo + 3, langHi] : null;
 }
 
 /** A fence closing line: three backticks, then spaces/tabs only. */
-function isFenceClose(line) {
-  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
-  for (let i = 3; i < line.length; i++) {
-    const c = line.charCodeAt(i);
+function isFenceCloseRange(s, lo, hi) {
+  if (hi - lo < 3 || s.charCodeAt(lo) !== 96 || s.charCodeAt(lo + 1) !== 96 || s.charCodeAt(lo + 2) !== 96) return false;
+  for (let i = lo + 3; i < hi; i++) {
+    const c = s.charCodeAt(i);
     if (c !== 32 && c !== 9) return false;
   }
   return true;
 }
 
-/** A heading line's level and text, or null (1 to 6 "#", a space or tab, then some text). */
-function headingOf(line) {
+/** A heading line's level and text range, or null (1 to 6 "#", a space or tab, then some text). */
+function headingRange(s, lo, hi) {
   let depth = 0;
-  while (depth < line.length && line.charCodeAt(depth) === 35) depth++;
-  if (depth === 0 || depth > 6 || depth === line.length) return null;
-  const c = line.charCodeAt(depth);
+  while (lo + depth < hi && s.charCodeAt(lo + depth) === 35) depth++;
+  if (depth === 0 || depth > 6 || lo + depth === hi) return null;
+  const c = s.charCodeAt(lo + depth);
   if (c !== 32 && c !== 9) return null;
-  let lo = depth;
-  while (lo < line.length && (line.charCodeAt(lo) === 32 || line.charCodeAt(lo) === 9)) lo++;
-  let hi = line.length;
-  while (hi > lo && (line.charCodeAt(hi - 1) === 32 || line.charCodeAt(hi - 1) === 9)) hi--;
-  if (hi === lo) return null;
-  return { depth, text: line.slice(lo, hi) };
+  let tlo = lo + depth;
+  while (tlo < hi && (s.charCodeAt(tlo) === 32 || s.charCodeAt(tlo) === 9)) tlo++;
+  let thi = hi;
+  while (thi > tlo && (s.charCodeAt(thi - 1) === 32 || s.charCodeAt(thi - 1) === 9)) thi--;
+  if (thi === tlo) return null;
+  return { depth, tlo, thi };
 }
 
 /** A thematic break line: "---" or "***", then spaces/tabs only. */
-function isBreakLine(line) {
-  const c = line.charCodeAt(0);
-  if ((c !== 45 && c !== 42) || line.charCodeAt(1) !== c || line.charCodeAt(2) !== c) return false;
-  for (let i = 3; i < line.length; i++) {
-    const t = line.charCodeAt(i);
+function isBreakRange(s, lo, hi) {
+  if (hi - lo < 3) return false;
+  const c = s.charCodeAt(lo);
+  if ((c !== 45 && c !== 42) || s.charCodeAt(lo + 1) !== c || s.charCodeAt(lo + 2) !== c) return false;
+  for (let i = lo + 3; i < hi; i++) {
+    const t = s.charCodeAt(i);
     if (t !== 32 && t !== 9) return false;
   }
   return true;
 }
 
-/** A bullet item line's text after "- " or "* ", or null. */
-function bulletOf(line) {
-  const c = line.charCodeAt(0);
-  if ((c === 45 || c === 42) && line.charCodeAt(1) === 32) return line.slice(2);
+/** A bullet item line's text range after "- " or "* ", or null. */
+function bulletRange(s, lo, hi) {
+  if (hi - lo < 2) return null;
+  const c = s.charCodeAt(lo);
+  if ((c === 45 || c === 42) && s.charCodeAt(lo + 1) === 32) return [lo + 2, hi];
   return null;
 }
 
-/** An ordered item line's number and text after "N. ", or null (1 to 9 digits). */
-function orderedOf(line) {
+/** An ordered item line's number and text range after "N. ", or null (1 to 9 digits). */
+function orderedRange(s, lo, hi) {
   let i = 0;
-  while (i < line.length) {
-    const c = line.charCodeAt(i);
+  while (lo + i < hi) {
+    const c = s.charCodeAt(lo + i);
     if (c < 48 || c > 57) break;
     i++;
   }
   if (i === 0 || i > 9) return null;
-  if (line.charCodeAt(i) !== 46 || line.charCodeAt(i + 1) !== 32) return null;
-  return { num: Number(line.slice(0, i)), text: line.slice(i + 2) };
+  if (lo + i >= hi || s.charCodeAt(lo + i) !== 46 || lo + i + 1 >= hi || s.charCodeAt(lo + i + 1) !== 32) return null;
+  let num = 0;
+  for (let k = 0; k < i; k++) num = num * 10 + (s.charCodeAt(lo + k) - 48);
+  return { num, tlo: lo + i + 2, thi: hi };
 }
 
 /** A list continuation line: two or more spaces, then a non-space. */
-function isContinuation(line) {
-  let i = 0;
-  while (i < line.length && line.charCodeAt(i) === 32) i++;
-  return i >= 2 && i < line.length && !isSpaceCode(line.charCodeAt(i));
-}
-
-/** Whether `line` ends a paragraph: blank, a fence, a heading or a thematic break. */
-function endsParagraph(line) {
-  return isBlankLine(line) || fenceOpenOf(line) !== null || headingOf(line) !== null || isBreakLine(line);
+function isContinuationRange(s, lo, hi) {
+  let i = lo;
+  while (i < hi && s.charCodeAt(i) === 32) i++;
+  return i - lo >= 2 && i < hi && !isSpaceCode(s.charCodeAt(i));
 }
 
 // The characters a backslash escapes, by char code.
@@ -381,10 +447,9 @@ const isEscapable = (ch) => {
 /**
  * Whether the character at `j` is escaped: preceded by an odd run of
  * backslashes. A run pairs off from its left (\\ is an escaped backslash),
- * so an odd run leaves one backslash free to escape what follows. This is
- * the per-character scanner's answer, computed from the run alone; the
+ * so an odd run leaves one backslash free to escape what follows. The
  * searches below always start right after a character that is not a
- * backslash (an opener), so no run crosses their start.
+ * backslash (an opener, a newline, a space), so no run crosses their start.
  */
 function isEscapedAt(s, j) {
   let run = 0;
@@ -427,198 +492,359 @@ function hasSpace(text) {
 }
 
 /**
- * `s[lo, hi)` rendered inline, appended to `out` (an array of string parts).
- * Plain runs are escaped in bulk; only the constructs (`\`, backtick, *, [)
- * break a run. `env.link(target)` resolves a link's href.
+ * Every character that can matter inline: the five HTML escapes and the
+ * four construct openers (\ ` * [). One native scan finds them all, so the
+ * text between two finds holds none of them: it needs no escaping and is
+ * copied as a single slice.
  */
-// The four characters that open an inline construct: \ ` * [
-const CONSTRUCT = /[\\`*[]/g;
+const INTERESTING = /[&<>"'\\`*[]/g;
 
+/**
+ * s[lo, hi) rendered inline, appended to `out` (an array of string parts).
+ * `seg` is the start of the pending plain run: everything before it is
+ * already in `out`, and the run itself is flushed as one slice when the
+ * next construct or escape is met. A construct that fails to close stays in
+ * the run as literal text, exactly where it stood. `env.link(target)`
+ * resolves a link's href.
+ */
 function inlineRange(s, lo, hi, env, out) {
   let i = lo;
+  let seg = lo;
   while (i < hi) {
-    const code = s.charCodeAt(i);
-    if (code !== 92 && code !== 96 && code !== 42 && code !== 91) {
-      // A plain run, up to the next construct character (a native scan).
-      CONSTRUCT.lastIndex = i;
-      const m = CONSTRUCT.exec(s);
-      const j = m === null || m.index >= hi ? hi : m.index;
-      out.push(escapeHtml(s.slice(i, j)));
-      i = j;
+    INTERESTING.lastIndex = i;
+    const m = INTERESTING.exec(s);
+    if (m === null || m.index >= hi) break;
+    const p = m.index;
+    const c = m[0];
+    if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") {
+      if (p > seg) out.push(s.slice(seg, p));
+      out.push(ESCAPES[c]);
+      i = p + 1;
+      seg = i;
       continue;
     }
-    const c = s[i];
     if (c === '\\') {
-      if (i + 1 < hi && isEscapable(s[i + 1])) {
-        out.push(escapeHtml(s[i + 1]));
-        i += 2;
+      if (p + 1 < hi && isEscapable(s[p + 1])) {
+        if (p > seg) out.push(s.slice(seg, p));
+        const n = s[p + 1];
+        out.push(n === '>' ? '&gt;' : n);
+        i = p + 2;
+        seg = i;
       } else {
-        out.push('\\');
-        i++;
+        i = p + 1;
       }
       continue;
     }
     if (c === '`') {
-      const found = s.indexOf('`', i + 1);
-      const j = found === -1 || found >= hi ? -1 : found;
-      if (j > i + 1) {
-        out.push('<code>', escapeHtml(s.slice(i + 1, j)), '</code>');
-        i = j + 1;
+      const f = s.indexOf('`', p + 1);
+      if (f !== -1 && f < hi && f > p + 1) {
+        if (p > seg) out.push(s.slice(seg, p));
+        out.push('<code>');
+        escapeRangeInto(s, p + 1, f, out);
+        out.push('</code>');
+        i = f + 1;
+        seg = i;
       } else {
-        out.push('`');
-        i++;
+        i = p + 1;
       }
       continue;
     }
     if (c === '*') {
-      if (i + 1 < hi && s[i + 1] === '*') {
-        const j = findUnescaped(s, '**', i + 2, hi);
-        if (j > i + 2) {
+      if (p + 1 < hi && s[p + 1] === '*') {
+        const j = findUnescaped(s, '**', p + 2, hi);
+        if (j > p + 2) {
+          if (p > seg) out.push(s.slice(seg, p));
           out.push('<strong>');
-          inlineRange(s, i + 2, j, env, out);
+          inlineRange(s, p + 2, j, env, out);
           out.push('</strong>');
           i = j + 2;
+          seg = i;
         } else {
-          out.push('**');
-          i += 2;
+          i = p + 2;
         }
         continue;
       }
-      const j = findSingleStar(s, i + 1, hi);
-      if (j > i + 1) {
+      const j = findSingleStar(s, p + 1, hi);
+      if (j > p + 1) {
+        if (p > seg) out.push(s.slice(seg, p));
         out.push('<em>');
-        inlineRange(s, i + 1, j, env, out);
+        inlineRange(s, p + 1, j, env, out);
         out.push('</em>');
         i = j + 1;
+        seg = i;
       } else {
-        out.push('*');
-        i++;
+        i = p + 1;
       }
       continue;
     }
     // c === '['
-    const k = findUnescaped(s, ']', i + 1, hi);
-    let m = -1;
+    const k = findUnescaped(s, ']', p + 1, hi);
+    let end = -1;
     if (k !== -1 && s[k + 1] === '(') {
       const found = s.indexOf(')', k + 2);
-      if (found !== -1 && found < hi) m = found;
+      if (found !== -1 && found < hi) end = found;
     }
-    const target = m === -1 ? '' : s.slice(k + 2, m);
+    const target = end === -1 ? '' : s.slice(k + 2, end);
     if (target !== '' && !hasSpace(target)) {
+      if (p > seg) out.push(s.slice(seg, p));
       out.push('<a href="', escapeHtml(env.link(target)), '">');
-      inlineRange(s, i + 1, k, env, out);
+      inlineRange(s, p + 1, k, env, out);
       out.push('</a>');
-      i = m + 1;
+      i = end + 1;
+      seg = i;
     } else {
-      out.push('[');
-      i++;
+      i = p + 1;
     }
   }
+  if (hi > seg) out.push(s.slice(seg, hi));
 }
 
-const CONSTRUCT_TEST = /[\\`*[]/;
-
-/** A whole string rendered inline. */
-function renderInline(s, env) {
-  // Most short strings (headings, list items, plain paragraphs) hold no
-  // construct character at all: they are just their escaping, with no
-  // parts array built and joined.
-  if (!CONSTRUCT_TEST.test(s)) return escapeHtml(s);
+/** s[lo, hi) rendered inline, as one string. */
+function renderInlineRange(s, lo, hi, env) {
   const out = [];
-  inlineRange(s, 0, s.length, env, out);
+  inlineRange(s, lo, hi, env, out);
   return out.join('');
 }
 
 /**
- * A body's lines rendered: its HTML (each block followed by "\n"), its table
- * of contents (every level 2 and 3 heading: level, id, inline HTML) and its
- * excerpt (the first paragraph's inline HTML, or ""). `slugify` is the build's
- * cached slug function.
+ * A body rendered from its text: its HTML (each block followed by "\n"),
+ * its table of contents (every level 2 and 3 heading: level, id, inline
+ * HTML), its excerpt (the first paragraph's inline HTML, or "") and its
+ * word count (the body's words, counted line by line as the lines are
+ * consumed — the newline between two lines is whitespace, so the sum over
+ * lines is the count of the joined body). Blocks render their inline text
+ * straight into the parts array, so no block pays for an array and a join
+ * of its own. `slugify` is the build's cached slug function.
  */
-function renderMarkdown(lines, env, slugify) {
+function renderMarkdown(text, start, env, slugify) {
+  const len = text.length;
   const ids = new Set();
   const parts = [];
   const toc = [];
   let excerpt = null;
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    if (isBlankLine(line)) {
-      i++;
-      continue;
+  let words = 0;
+  // The current line is text[lo, hi); nl is the index of its newline, or -1
+  // when it runs to the end of the text. A body always has at least one
+  // line (an empty body is one empty line); a line that ends in a newline
+  // at the very end of the text is followed by one last empty line.
+  let lo = start;
+  let nl = text.indexOf('\n', lo);
+  let hi = nl === -1 ? len : nl;
+  let alive = true;
+  const step = () => {
+    words += wordsInRange(text, lo, hi);
+    if (nl === -1) {
+      alive = false;
+      return;
     }
-    const lang = fenceOpenOf(line);
-    if (lang !== null) {
-      i++;
-      const body = [];
-      while (i < lines.length && !isFenceClose(lines[i])) body.push(escapeHtml(lines[i++]) + '\n');
-      if (i < lines.length) i++;
-      const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
-      parts.push(`<pre><code${cls}>`, body.join(''), '</code></pre>\n');
-      continue;
+    lo = nl + 1;
+    nl = text.indexOf('\n', lo);
+    hi = nl === -1 ? len : nl;
+  };
+  // Classification scratch: classify() fills these fields for the current
+  // line instead of allocating a result object per line. cA/cB/cC carry the
+  // kind's payload (a fence's language range, a heading's depth and text
+  // range, a list item's number and text range).
+  let cKind = K_TEXT;
+  let cA = 0;
+  let cB = 0;
+  let cC = 0;
+  const classify = () => {
+    if (isBlankRange(text, lo, hi)) {
+      cKind = K_BLANK;
+      return;
     }
-    const heading = headingOf(line);
-    if (heading !== null) {
-      const id = uniqueSlug(slugify(heading.text), ids);
-      const html = renderInline(heading.text, env);
-      parts.push(`<h${heading.depth} id="${id}">`, html, `</h${heading.depth}>\n`);
-      if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
-      i++;
-      continue;
-    }
-    if (isBreakLine(line)) {
-      parts.push('<hr>\n');
-      i++;
-      continue;
-    }
-    if (line.charCodeAt(0) === 62) {
-      const body = [];
-      while (i < lines.length && lines[i].charCodeAt(0) === 62) {
-        let stripped = lines[i].slice(1);
-        if (stripped.charCodeAt(0) === 32) stripped = stripped.slice(1);
-        const t = trimLine(stripped);
-        if (t !== '') body.push(t);
-        i++;
+    const c0 = text.charCodeAt(lo);
+    if (c0 === 96) {
+      const f = fenceOpenRange(text, lo, hi);
+      if (f !== null) {
+        cKind = K_FENCE;
+        cA = f[0];
+        cB = f[1];
+        return;
       }
-      if (body.length === 0) parts.push('<blockquote>\n</blockquote>\n');
-      else parts.push('<blockquote>\n<p>', renderInline(body.join('\n'), env), '</p>\n</blockquote>\n');
+    } else if (c0 === 35) {
+      const h = headingRange(text, lo, hi);
+      if (h !== null) {
+        cKind = K_HEADING;
+        cA = h.depth;
+        cB = h.tlo;
+        cC = h.thi;
+        return;
+      }
+    }
+    if ((c0 === 45 || c0 === 42) && isBreakRange(text, lo, hi)) {
+      cKind = K_BREAK;
+      return;
+    }
+    if (c0 === 62) {
+      cKind = K_QUOTE;
+      return;
+    }
+    if (c0 === 45 || c0 === 42) {
+      const b = bulletRange(text, lo, hi);
+      if (b !== null) {
+        cKind = K_BULLET;
+        cA = b[0];
+        cB = b[1];
+        return;
+      }
+    } else if (c0 >= 48 && c0 <= 57) {
+      const o = orderedRange(text, lo, hi);
+      if (o !== null) {
+        cKind = K_ORDERED;
+        cA = o.num;
+        cB = o.tlo;
+        cC = o.thi;
+        return;
+      }
+    }
+    cKind = K_TEXT;
+  };
+  // hasCur: the current line's classification already sits in the scratch
+  // fields (a paragraph that stopped at an ender line leaves it there).
+  let hasCur = false;
+  // trimInto fills tLo/tHi with the current line's space/tab-trimmed range
+  // (trimRange's rule), for the paragraph loop's per-line use.
+  let tLo = 0;
+  let tHi = 0;
+  const trimInto = () => {
+    tLo = lo;
+    tHi = hi;
+    while (tLo < tHi && (text.charCodeAt(tLo) === 32 || text.charCodeAt(tLo) === 9)) tLo++;
+    while (tHi > tLo && (text.charCodeAt(tHi - 1) === 32 || text.charCodeAt(tHi - 1) === 9)) tHi--;
+  };
+  while (alive) {
+    if (!hasCur) classify();
+    hasCur = false;
+    if (cKind === K_BLANK) {
+      step();
       continue;
     }
-    const bullet = bulletOf(line);
-    const ordered = bullet === null ? orderedOf(line) : null;
-    if (bullet !== null || ordered !== null) {
-      const isOrdered = ordered !== null;
+    if (cKind === K_FENCE) {
+      const langLo = cA;
+      const langHi = cB;
+      step();
+      const cStart = lo;
+      let cEnd = lo;
+      let has = false;
+      while (alive && !isFenceCloseRange(text, lo, hi)) {
+        cEnd = hi;
+        has = true;
+        step();
+      }
+      if (alive) step();
+      const clsAttr = langLo === langHi ? '' : ` class="language-${escapeHtml(text.slice(langLo, langHi))}"`;
+      parts.push(`<pre><code${clsAttr}>`);
+      if (has) {
+        escapeRangeInto(text, cStart, cEnd, parts);
+        parts.push('\n');
+      }
+      parts.push('</code></pre>\n');
+      continue;
+    }
+    if (cKind === K_HEADING) {
+      const depth = cA;
+      const id = uniqueSlug(slugify(text.slice(cB, cC)), ids);
+      const html = renderInlineRange(text, cB, cC, env);
+      parts.push(`<h${depth} id="${id}">`, html, `</h${depth}>\n`);
+      if (depth === 2 || depth === 3) toc.push({ level: depth, id, html });
+      step();
+      continue;
+    }
+    if (cKind === K_BREAK) {
+      parts.push('<hr>\n');
+      step();
+      continue;
+    }
+    if (cKind === K_QUOTE) {
+      const segs = [];
+      while (alive && hi > lo && text.charCodeAt(lo) === 62) {
+        let a = lo + 1;
+        if (a < hi && text.charCodeAt(a) === 32) a++;
+        const [tlo, thi] = trimRange(text, a, hi);
+        if (thi > tlo) segs.push(text.slice(tlo, thi));
+        step();
+      }
+      if (segs.length === 0) parts.push('<blockquote>\n</blockquote>\n');
+      else {
+        const joined = segs.join('\n');
+        parts.push('<blockquote>\n<p>', renderInlineRange(joined, 0, joined.length, env), '</p>\n</blockquote>\n');
+      }
+      continue;
+    }
+    if (cKind === K_BULLET || cKind === K_ORDERED) {
+      const isOrdered = cKind === K_ORDERED;
       const items = [];
-      while (i < lines.length) {
-        const m = isOrdered ? orderedOf(lines[i]) : bulletOf(lines[i]);
+      let firstNum = 0;
+      while (alive) {
+        const m = isOrdered ? orderedRange(text, lo, hi) : bulletRange(text, lo, hi);
         if (m !== null) {
-          items.push([trimLine(isOrdered ? m.text : m)]);
-          i++;
-        } else if (isContinuation(lines[i])) {
-          items[items.length - 1].push(trimLine(lines[i]));
-          i++;
+          if (items.length === 0 && isOrdered) firstNum = m.num;
+          items.push([trimRange(text, isOrdered ? m.tlo : m[0], isOrdered ? m.thi : m[1])]);
+          step();
+        } else if (items.length > 0 && isContinuationRange(text, lo, hi)) {
+          items[items.length - 1].push(trimRange(text, lo, hi));
+          step();
         } else break;
       }
       const tag = isOrdered ? 'ol' : 'ul';
-      const open = isOrdered && ordered.num !== 1 ? `<ol start="${ordered.num}">` : `<${tag}>`;
-      parts.push(`${open}\n`);
-      for (const item of items) parts.push('<li>', renderInline(item.join('\n'), env), '</li>\n');
+      parts.push(isOrdered && firstNum !== 1 ? `<ol start="${firstNum}">` : `<${tag}>`, '\n');
+      for (const item of items) {
+        parts.push('<li>');
+        if (item.length === 1) {
+          inlineRange(text, item[0][0], item[0][1], env, parts);
+        } else {
+          const joined = item.map(([a, b]) => text.slice(a, b)).join('\n');
+          inlineRange(joined, 0, joined.length, env, parts);
+        }
+        parts.push('</li>\n');
+      }
       parts.push(`</${tag}>\n`);
       continue;
     }
-    const body = [trimLine(line)];
-    i++;
-    while (i < lines.length && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    const html = renderInline(body.join('\n'), env);
-    if (excerpt === null) excerpt = html;
-    parts.push('<p>', html, '</p>\n');
+    // A paragraph: this line and every following line that does not end a
+    // paragraph (blank, a fence, a heading or a thematic break). When no
+    // line needs trimming, the joined text is one range of the body. The
+    // lines' trimmed ranges are kept flat (lo, hi, lo, hi, ...) in one
+    // array, not an array per line.
+    const ranges = [];
+    let simple = true;
+    let lastHi = hi;
+    for (;;) {
+      trimInto();
+      if (tLo !== lo || tHi !== hi) simple = false;
+      ranges.push(tLo, tHi);
+      lastHi = tHi;
+      step();
+      if (!alive) break;
+      classify();
+      if (cKind === K_BLANK || cKind === K_FENCE || cKind === K_HEADING || cKind === K_BREAK) {
+        hasCur = true;
+        break;
+      }
+    }
+    parts.push('<p>');
+    const mark = parts.length;
+    if (simple) {
+      inlineRange(text, ranges[0], lastHi, env, parts);
+    } else {
+      const segs = [];
+      for (let r = 0; r < ranges.length; r += 2) segs.push(text.slice(ranges[r], ranges[r + 1]));
+      const joined = segs.join('\n');
+      inlineRange(joined, 0, joined.length, env, parts);
+    }
+    if (excerpt === null) excerpt = parts.slice(mark).join('');
+    parts.push('</p>\n');
   }
-  return { html: parts.join(''), toc, excerpt: excerpt ?? '' };
+  return { html: parts.join(''), toc, excerpt: excerpt ?? '', words };
 }
 
 // ---------------------------------------------------------------------------
 // Templates: parsed once per case into node trees, then compiled to plain
-// functions that render in a chain of scopes.
+// functions that render in a chain of scopes. A compiled function's path
+// arrays are hoisted into constants at its head, so a lookup reads a
+// variable instead of building the same array on every page.
 // ---------------------------------------------------------------------------
 
 const INCLUDE_DEPTH = 8;
@@ -915,16 +1141,30 @@ const TPL_HELPERS = {
  * literal pushes; a path whose root an enclosing loop binds becomes a read
  * of that loop's local variable, not a scope-chain lookup; an include
  * inside a loop receives a scope holding exactly the locals bound there.
- * Every value rule (lookup, conversion, truth, escaping, the depth cap,
- * the memo) is the shared helper's, unchanged. Generated names carry a "$"
- * because template names cannot: no loop variable a template names can
- * collide with the machinery.
+ * Every path a function reads is declared once at its head ($P0, $P1, ...),
+ * so the per-page code passes a variable to the lookup instead of building
+ * the path's array again. Every value rule (lookup, conversion, truth,
+ * escaping, the depth cap, the memo) is the shared helper's, unchanged.
+ * Generated names carry a "$" because template names cannot: no loop
+ * variable a template names can collide with the machinery.
  */
 function compileTemplate(nodes) {
   const lines = [];
+  const decls = [];
+  const pathIds = new Map();
   const scopes = [];
   let temp = 0;
   let loopN = 0;
+  const pathVar = (path) => {
+    const key = JSON.stringify(path);
+    let v = pathIds.get(key);
+    if (v === undefined) {
+      v = `$P${pathIds.size}`;
+      pathIds.set(key, v);
+      decls.push(`const ${v} = ${key};`);
+    }
+    return v;
+  };
   const resolveRoot = (root) => {
     for (let i = scopes.length - 1; i >= 0; i--) {
       const local = scopes[i].get(root);
@@ -935,9 +1175,9 @@ function compileTemplate(nodes) {
   const pathExpr = (path) => {
     const local = resolveRoot(path[0]);
     if (local !== null) {
-      return path.length === 1 ? local : `$H.walk(${local}, ${JSON.stringify(path)}, 1)`;
+      return path.length === 1 ? local : `$H.walk(${local}, ${pathVar(path)}, 1)`;
     }
-    return `$H.lookup($scope, ${JSON.stringify(path)})`;
+    return `$H.lookup($scope, ${pathVar(path)})`;
   };
   const gen = (ns) => {
     for (const n of ns) {
@@ -1018,7 +1258,7 @@ function compileTemplate(nodes) {
     }
   };
   gen(nodes);
-  return new Function('$scope', '$ctx', '$depth', '$out', '$H', lines.join('\n'));
+  return new Function('$scope', '$ctx', '$depth', '$out', '$H', decls.join('\n') + '\n' + lines.join('\n'));
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,7 +1348,7 @@ function buildSite(input) {
   for (const f of files) {
     if (f.path.endsWith('.md')) {
       const text = f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content;
-      sources.push({ path: f.path, lines: text.split('\n') });
+      sources.push({ path: f.path, text });
     } else {
       statics.push({ path: f.path, content: f.content });
     }
@@ -1117,13 +1357,13 @@ function buildSite(input) {
   // Front matter and the refusal checks, in their fixed order.
   const kept = [];
   for (const s of sources) {
-    const fm = parseFrontMatter(s.lines);
+    const fm = parseFrontMatter(s.text);
     if ('error' in fm) {
       report.push(`refused ${s.path}: ${fm.error}`);
       continue;
     }
     s.data = fm.data;
-    s.bodyLines = fm.bodyLines;
+    s.bodyStart = fm.bodyStart;
     s.post = s.path.startsWith('posts/');
     const own = RESERVED.find((d) => d !== 'posts' && s.path.startsWith(`${d}/`));
     if (own !== undefined) {
@@ -1164,20 +1404,21 @@ function buildSite(input) {
   }
 
   // Markdown, each body's links resolved against the pages and static files.
-  // A target's resolution depends only on its source's directory, so it is
-  // cached per build; a broken target still reports once per source.
+  // A target's resolution depends only on its source's directory, and a
+  // source's directory never changes while it renders, so the cache is per
+  // source and keyed by the target alone; a broken target still reports
+  // once per source.
   const staticPaths = new Set(statics.map((f) => f.path));
   const broken = new Set();
-  const linkCache = new Map();
   for (const s of kept) {
     const dir = dirOf(s.path);
     const dirSegs = dir === '' ? [] : dir.split('/');
+    const linkCache = new Map();
     const env = {
       link: (target) => {
         if (SCHEME.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
-        const key = `${dir}\n${target}`;
-        if (linkCache.has(key)) {
-          const hit = linkCache.get(key);
+        if (linkCache.has(target)) {
+          const hit = linkCache.get(target);
           if (hit !== null) return hit;
           broken.add(`broken-link ${s.path} -> ${target}`);
           return target;
@@ -1189,16 +1430,17 @@ function buildSite(input) {
         let href = null;
         if (path !== null && bySource.has(path)) href = `${bySource.get(path).url}${frag}`;
         else if (path !== null && staticPaths.has(path)) href = `${base}/${path}${frag}`;
-        linkCache.set(key, href);
+        linkCache.set(target, href);
         if (href !== null) return href;
         broken.add(`broken-link ${s.path} -> ${target}`);
         return target;
       },
     };
-    const md = renderMarkdown(s.bodyLines, env, slugify);
+    const md = renderMarkdown(s.text, s.bodyStart, env, slugify);
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
+    s.words = md.words;
   }
 
   // The posts, newest date first, and equal dates by slug; newer and older set.
@@ -1257,11 +1499,12 @@ function buildSite(input) {
         };
   // A source's card is built once and shared by every list and page that
   // shows it (templates only ever read cards, never change them). The word
-  // count of the joined body is the sum of its lines' counts: the "\n" that
-  // joins two lines is whitespace, so no word runs across a join.
+  // count was taken during the body's own rendering pass: the "\n" that
+  // joins two lines is whitespace, so the sum of the lines' counts is the
+  // count of the joined body, and no second scan is needed.
   const cardOf = (s) => {
     if (s.card !== undefined) return s.card;
-    const words = wordsOf(s.bodyLines.join('\n'));
+    const words = s.words ?? wordsInRange(s.text, s.bodyStart, s.text.length);
     s.card = {
       title: s.data.title,
       url: s.url,
@@ -1290,11 +1533,13 @@ function buildSite(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const render = (name, vars) => {
+  const render = (name, extra) => {
     const fn = compiled.get(name);
     if (fn === undefined) return null;
+    const vars = { site, tags: allTags, recent };
+    for (const k of Object.keys(extra)) vars[k] = extra[k];
     const out = [];
-    fn({ vars: { site, tags: allTags, recent, ...vars }, parent: null }, tplCtx, 0, out, TPL_HELPERS);
+    fn({ vars, parent: null }, tplCtx, 0, out, TPL_HELPERS);
     return out.join('');
   };
   const output = {};
@@ -1343,5 +1588,3 @@ function buildSite(input) {
 export function run(input) {
   return buildSite(input);
 }
-
-
